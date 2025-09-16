@@ -5,8 +5,12 @@ from __future__ import annotations
 import base64
 import importlib
 import io
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 from types import ModuleType
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 from fastmcp import FastMCP
 
@@ -22,6 +26,52 @@ if pyautogui is not None:
     pyautogui.PAUSE = 0.05
 
 mcp = FastMCP("MacOS Automation Server")
+
+
+def _capture_screenshot_without_pyautogui(region: Optional[Tuple[int, int, int, int]]) -> bytes:
+    """Capture a screenshot using macOS's ``screencapture`` utility."""
+
+    if sys.platform != "darwin":
+        raise RuntimeError(
+            "pyautogui is required for screenshots on non-macOS platforms."
+        )
+
+    command = ["screencapture", "-x"]
+    if region is not None:
+        command.append(
+            f"-R{region[0]},{region[1]},{region[2]},{region[3]}"
+        )
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+        temp_path = Path(temp_file.name)
+
+    try:
+        command.append(str(temp_path))
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:  # pragma: no cover - requires macOS binary
+            raise RuntimeError(
+                "The 'screencapture' command is required for screenshots when PyAutoGUI is unavailable."
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            stderr_output = (
+                exc.stderr.decode("utf-8", "ignore") if exc.stderr else ""
+            )
+            message = "The 'screencapture' command failed."
+            if stderr_output.strip():
+                message += f" Details: {stderr_output.strip()}"
+            raise RuntimeError(message) from exc
+        return temp_path.read_bytes()
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:  # pragma: no cover - best effort cleanup
+            pass
 
 
 def _normalize_button(button: str) -> str:
@@ -44,17 +94,31 @@ def get_screenshot(region: Optional[Sequence[int]] = None) -> str:
     """Return a PNG screenshot encoded as a data URL.
 
     If ``region`` is provided, it must contain ``[x, y, width, height]`` values.
+    When :mod:`pyautogui` is unavailable on macOS, the function falls back to the
+    native ``screencapture`` utility.
     """
 
     if region is not None and len(region) != 4:
         raise ValueError("Region must contain exactly four integers: x, y, width, height.")
 
-    module = _require_pyautogui()
-    region_tuple = tuple(int(value) for value in region) if region is not None else None
-    screenshot = module.screenshot(region=region_tuple)
-    buffer = io.BytesIO()
-    screenshot.save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    region_tuple: Optional[Tuple[int, int, int, int]] = (
+        tuple(int(value) for value in region) if region is not None else None
+    )
+    if region_tuple is not None:
+        x, y, width, height = region_tuple
+        if width <= 0 or height <= 0:
+            raise ValueError("Width and height must be positive values.")
+        region_tuple = (x, y, width, height)
+
+    if pyautogui is not None:
+        screenshot = pyautogui.screenshot(region=region_tuple)
+        buffer = io.BytesIO()
+        screenshot.save(buffer, format="PNG")
+        image_bytes = buffer.getvalue()
+    else:
+        image_bytes = _capture_screenshot_without_pyautogui(region_tuple)
+
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:image/png;base64,{encoded}"
 
 
