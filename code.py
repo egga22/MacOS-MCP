@@ -28,12 +28,14 @@ if pyautogui is not None:
 mcp = FastMCP("MacOS Automation Server")
 
 
-def _capture_screenshot_without_pyautogui(region: Optional[Tuple[int, int, int, int]]) -> bytes:
+def _capture_screenshot_via_screencapture(
+    region: Optional[Tuple[int, int, int, int]]
+) -> bytes:
     """Capture a screenshot using macOS's ``screencapture`` utility."""
 
     if sys.platform != "darwin":
         raise RuntimeError(
-            "pyautogui is required for screenshots on non-macOS platforms."
+            "The 'screencapture' fallback is only available on macOS."
         )
 
     command = ["screencapture", "-x"]
@@ -89,13 +91,73 @@ def _require_pyautogui() -> ModuleType:
     return pyautogui
 
 
+def _capture_screenshot_with_mss(
+    region: Optional[Tuple[int, int, int, int]]
+) -> bytes:
+    """Capture a screenshot using the optional :mod:`mss` package."""
+
+    try:
+        import mss
+        from mss import tools as mss_tools
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("The 'mss' package is not installed.") from exc
+
+    with mss.mss() as screen_capture:
+        if region is None:
+            monitor = screen_capture.monitors[0]
+            bounding_box = monitor
+        else:
+            x, y, width, height = region
+            bounding_box = {
+                "left": x,
+                "top": y,
+                "width": width,
+                "height": height,
+            }
+        try:
+            screenshot = screen_capture.grab(bounding_box)
+        except Exception as exc:  # pragma: no cover - backend specific failures
+            raise RuntimeError(
+                f"The 'mss' screenshot backend failed: {exc}"
+            ) from exc
+        return mss_tools.to_png(screenshot.rgb, screenshot.size)
+
+
+def _capture_screenshot_with_pillow(
+    region: Optional[Tuple[int, int, int, int]]
+) -> bytes:
+    """Capture a screenshot using Pillow's :mod:`ImageGrab` module."""
+
+    try:
+        from PIL import ImageGrab
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("The 'Pillow' package is not installed.") from exc
+
+    bbox: Optional[Tuple[int, int, int, int]]
+    if region is None:
+        bbox = None
+    else:
+        x, y, width, height = region
+        bbox = (x, y, x + width, y + height)
+
+    try:
+        image = ImageGrab.grab(bbox=bbox)
+    except Exception as exc:  # pragma: no cover - backend specific failures
+        raise RuntimeError(f"Pillow's ImageGrab backend failed: {exc}") from exc
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 @mcp.tool
 def get_screenshot(region: Optional[Sequence[int]] = None) -> str:
     """Return a PNG screenshot encoded as a data URL.
 
     If ``region`` is provided, it must contain ``[x, y, width, height]`` values.
-    When :mod:`pyautogui` is unavailable on macOS, the function falls back to the
-    native ``screencapture`` utility.
+    The function attempts to use :mod:`pyautogui` when available and falls back to
+    optional backends such as :mod:`mss`, :mod:`PIL.ImageGrab`, or the macOS
+    ``screencapture`` utility.
     """
 
     if region is not None and len(region) != 4:
@@ -110,13 +172,45 @@ def get_screenshot(region: Optional[Sequence[int]] = None) -> str:
             raise ValueError("Width and height must be positive values.")
         region_tuple = (x, y, width, height)
 
+    image_bytes: Optional[bytes] = None
+    errors: List[str] = []
+
     if pyautogui is not None:
-        screenshot = pyautogui.screenshot(region=region_tuple)
-        buffer = io.BytesIO()
-        screenshot.save(buffer, format="PNG")
-        image_bytes = buffer.getvalue()
+        try:
+            screenshot = pyautogui.screenshot(region=region_tuple)
+        except Exception as exc:  # pragma: no cover - delegated to fallback
+            errors.append(f"PyAutoGUI failed to capture the screen: {exc}")
+        else:
+            buffer = io.BytesIO()
+            screenshot.save(buffer, format="PNG")
+            image_bytes = buffer.getvalue()
     else:
-        image_bytes = _capture_screenshot_without_pyautogui(region_tuple)
+        errors.append("PyAutoGUI is not installed.")
+
+    if image_bytes is None:
+        for backend in (
+            _capture_screenshot_with_mss,
+            _capture_screenshot_with_pillow,
+            _capture_screenshot_via_screencapture,
+        ):
+            try:
+                image_bytes = backend(region_tuple)
+            except RuntimeError as exc:
+                errors.append(str(exc))
+            else:
+                break
+
+    if image_bytes is None:
+        message = (
+            "Unable to capture screenshot because none of the available backends succeeded."
+        )
+        if errors:
+            unique_errors: List[str] = []
+            for error in errors:
+                if error not in unique_errors:
+                    unique_errors.append(error)
+            message += " Errors: " + "; ".join(unique_errors)
+        raise RuntimeError(message)
 
     encoded = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:image/png;base64,{encoded}"
